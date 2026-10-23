@@ -1,0 +1,12 @@
+[workspace]
+members = [
+  "address-note",
+  "aztec",
+  "balance-set",
+  "compressed-string",
+  "contract-instance-registry-interface",
+  "ecdsa-public-key-note",
+  "fee-juice-interface",
+  "field-note",
+  "uint-note",
+]
