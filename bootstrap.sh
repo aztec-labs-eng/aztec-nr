@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+"$(git rev-parse --show-toplevel)/bootstrap.sh" init || exit 1
+source $(git rev-parse --show-toplevel)/ci3/source_bootstrap
+
+export RAYON_NUM_THREADS=${RAYON_NUM_THREADS:-16}
+export HARDWARE_CONCURRENCY=${HARDWARE_CONCURRENCY:-16}
+ROOT=$(git rev-parse --show-toplevel)
+export NARGO=${NARGO:-"$ROOT/labs-aztec-toolchain/bin/nargo"}
+export AZTEC_TOOLCHAIN_HASH=${AZTEC_TOOLCHAIN_HASH:-$($ROOT/labs-aztec-toolchain/bootstrap.sh hash)}
+
+hash=$(hash_str $AZTEC_TOOLCHAIN_HASH $(cache_content_hash "^noir-projects/aztec-nr"))
+
+# Below the Linux ephemeral range (32768-60999) to avoid conflicts.
+DEFAULT_TXE_PORT=14730
+DEFAULT_RESOLVER_PORT=14830
+
+function build {
+  # Being a library, aztec-nr does not technically need to be built. But we can still run nargo check to find any type
+  # errors and prevent warnings
+  echo_stderr "Checking aztec-nr for warnings..."
+  # nargo resolves git dependencies (e.g. noir-lang/sha256, noir-lang/poseidon) by cloning from
+  # github.com on a cold cache, which intermittently fails with transient DNS/network errors. Retry
+  # only on those transport failures so a flaky clone does not fail CI, while genuine
+  # check failures (type errors, warnings) still fail immediately.
+  local git_net_flake="Could not resolve host|unable to access|Connection timed out|Connection refused|Failed to connect|TLS connect error|early EOF|RPC failed"
+  retry -p "$git_net_flake" "$NARGO check --deny-warnings"
+
+  # We also check that no docstring links are broken
+  retry -p "$git_net_flake" "$NARGO doc --check"
+}
+
+function test_cmds {
+  # Tests run against the TXE server (oracle roundtrip tests against the oracle test resolver),
+  # so inject those dependencies: key each flavor on its entry point's dependency closure
+  # (computed by yarn-project's build). The build hash alone under-covers — a TXE behavior
+  # change must rerun these tests even though no aztec-nr source changed. The scripts that select and
+  # run each chunk's tests are inputs too.
+  local scripts_hash
+  scripts_hash=$(cache_content_hash "^noir-projects/scripts/")
+  local test_hash=$(hash_str $hash $scripts_hash)
+  local txe_test_hash=$(hash_str $test_hash $($ROOT/yarn-project/bootstrap.sh require_dep_hash txe/src/bin/index.ts))
+  local resolver_test_hash=$(hash_str $test_hash $($ROOT/yarn-project/bootstrap.sh require_dep_hash txe/src/bin/oracle_test_server.ts))
+
+  # Oracle roundtrip tests run against a dedicated resolver instead of TXE. The rest spread over the
+  # NUM_TXES TXEs on consecutive ports.
+  local resolver_port=${1:-$DEFAULT_RESOLVER_PORT}
+  $NARGO test --list-tests --silence-warnings | $ROOT/noir-projects/scripts/test_chunks.sh |
+    while read -r package kind chunk; do
+      local cmd="noir-projects/scripts/run_test_chunk.sh aztec-nr $package $kind $chunk"
+      if [ "$kind" == oracle ]; then
+        echo "$resolver_test_hash $cmd $resolver_port"
+      else
+        echo "$txe_test_hash $cmd $DEFAULT_TXE_PORT ${NUM_TXES:-1}"
+      fi
+    done
+}
+
+# Starts a TXE and the oracle test resolver, and stops them when the script exits.
+function start_servers {
+  trap 'kill $(jobs -p)' EXIT
+
+  check_port $DEFAULT_TXE_PORT || echo "WARNING: port $DEFAULT_TXE_PORT is in use, TXE may fail to start"
+  (cd $root/yarn-project/txe && UV_THREADPOOL_SIZE=8 LOG_LEVEL=error TXE_PORT=$DEFAULT_TXE_PORT yarn start) &
+
+  check_port $DEFAULT_RESOLVER_PORT || echo "WARNING: port $DEFAULT_RESOLVER_PORT is in use, oracle test resolver may fail to start"
+  (cd $root/yarn-project/txe && LOG_LEVEL=error ORACLE_TEST_PORT=$DEFAULT_RESOLVER_PORT yarn start:oracle-test-resolver) &
+
+  wait_for_port() {
+    local port=$1 name=$2 j=0
+    echo "Waiting for $name to start..."
+    while ! nc -z 127.0.0.1 $port &>/dev/null; do
+      if [ $j == 60 ]; then
+        echo "$name failed to start on port $port after 60s." >&2
+        check_port $port
+        exit 1
+      fi
+      sleep 1
+      j=$((j+1))
+    done
+  }
+  wait_for_port $DEFAULT_TXE_PORT "TXE"
+  wait_for_port $DEFAULT_RESOLVER_PORT "oracle test resolver"
+}
+
+function test {
+  start_servers
+  export NARGO_FOREIGN_CALL_TIMEOUT=300000
+  NUM_TXES=1 test_cmds | filter_test_cmds | parallelize
+}
+
+function test-one {
+  if [ "$#" -ne 2 ]; then
+    echo_stderr "Usage: ./bootstrap.sh test-one <package> <exact_test_name>"
+    return 1
+  fi
+
+  local package=$1
+  local test_name=$2
+  local port=$DEFAULT_TXE_PORT
+  [[ "$test_name" == *__oracle_test__* ]] && port=$DEFAULT_RESOLVER_PORT
+  start_servers
+
+  $root/noir-projects/scripts/run_test.sh aztec-nr "$package" "$test_name" "$port"
+}
+
+function format {
+  $NARGO fmt
+}
+
+function release {
+  release_git_push "main" $REF_NAME
+}
+
+function release_git_push {
+  local branch_name=$1
+  local tag_name=$2
+  local mirrored_repo_url="https://github.com/aztec-labs-eng/aztec-nr.git"
+  local mirrored_repo_push_url="git@github.com:aztec-labs-eng/aztec-nr.git"
+
+  if [ "${DRY_RUN:-0}" = 0 ] && [ ! -r "${AZTEC_NR_GITHUB_MIRROR_DEPLOY_KEY_FILE:-}" ]; then
+    echo "AZTEC_NR_GITHUB_MIRROR_DEPLOY_KEY_FILE must name the mirror's deploy key to push to $mirrored_repo_push_url" >&2
+    exit 1
+  fi
+
+  # Every release is tagged, so nightlies and release-PR canaries can be depended on and tested,
+  # but only a stable release is based on the branch and moves it: the branch is what people see
+  # when they browse the mirror, and it should show released code, not a nightly or an unreviewed
+  # PR. Every other release is a parentless snapshot, so its history does not claim a lineage the
+  # branch never had.
+  local stable=0
+  if [ "$(REF_NAME=$tag_name dist_tag)" = latest ]; then
+    stable=1
+  fi
+
+  # Clean up our release directory.
+  rm -rf release-out && mkdir release-out
+
+  # Copy our git files to our release directory. The crates ship exactly as committed, including
+  # the protocol_types pin: it names the foundation release this tree is built and tested against,
+  # which is unrelated to this repo's own version, so it must not be rewritten to the released tag.
+  git archive HEAD -- . | tar -x -C release-out
+
+  cd release-out
+
+  git init &>/dev/null
+  git config user.name "Aztec Labs aztec-nr release"
+  git config user.email "noreply@aztec-labs.com"
+  git remote add origin "$mirrored_repo_url" &>/dev/null
+
+  # Pushes authenticate over ssh with the mirror's deploy key; fetches stay anonymous.
+  if [ "${DRY_RUN:-0}" = 0 ]; then
+    # GitHub's ssh host key, as published at https://api.github.com/meta.
+    local known_hosts=$(mktemp)
+    trap "rm -f $known_hosts" EXIT
+    echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > $known_hosts
+    export GIT_SSH_COMMAND="ssh -i $AZTEC_NR_GITHUB_MIRROR_DEPLOY_KEY_FILE -o IdentitiesOnly=yes -o UserKnownHostsFile=$known_hosts -o StrictHostKeyChecking=yes"
+    git remote set-url --push origin "$mirrored_repo_push_url"
+  fi
+
+  if [ -n "$(git ls-remote --tags origin "refs/tags/$tag_name")" ]; then
+    echo "Tag $tag_name already exists. Skipping release."
+    return
+  fi
+
+  if [ $stable = 1 ] && [ -n "$(git ls-remote --heads origin "refs/heads/$branch_name")" ]; then
+    git fetch origin --quiet
+    # Update branch reference without checkout.
+    git branch -f "$branch_name" origin/"$branch_name"
+    # Point HEAD to the branch.
+    git symbolic-ref HEAD refs/heads/"$branch_name"
+    # Move to latest commit, keep working tree.
+    git reset --soft origin/"$branch_name"
+  else
+    # HEAD is unborn in the fresh repository, so the release becomes a root commit.
+    git checkout -q -b "$branch_name"
+  fi
+
+  git add .
+  # Every release gets its own commit even when the crates did not change since the last one.
+  git commit --allow-empty -m "Release $tag_name." >/dev/null
+  git tag -a "$tag_name" -m "Release $tag_name."
+
+  if [ $stable = 1 ]; then
+    do_or_dryrun git push origin "$branch_name" --quiet
+  fi
+  do_or_dryrun git push origin --quiet --force "$tag_name"
+
+  echo "Release complete ($tag_name)."
+}
+
+case "$cmd" in
+  "")
+    build
+    ;;
+  "hash")
+    echo $hash
+    ;;
+  *)
+    default_cmd_handler "$@"
+    ;;
+esac
